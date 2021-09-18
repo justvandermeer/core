@@ -21,7 +21,12 @@ from homeassistant.exceptions import (
 )
 from homeassistant.helpers import device_registry, entity_registry
 from homeassistant.helpers.event import Event
-from homeassistant.helpers.typing import UNDEFINED, DiscoveryInfoType, UndefinedType
+from homeassistant.helpers.typing import (
+    UNDEFINED,
+    ConfigType,
+    DiscoveryInfoType,
+    UndefinedType,
+)
 from homeassistant.setup import async_process_deps_reqs, async_setup_component
 from homeassistant.util.decorator import Registry
 import homeassistant.util.uuid as uuid_util
@@ -35,6 +40,7 @@ SOURCE_IMPORT = "import"
 SOURCE_INTEGRATION_DISCOVERY = "integration_discovery"
 SOURCE_MQTT = "mqtt"
 SOURCE_SSDP = "ssdp"
+SOURCE_USB = "usb"
 SOURCE_USER = "user"
 SOURCE_ZEROCONF = "zeroconf"
 SOURCE_DHCP = "dhcp"
@@ -98,7 +104,12 @@ DEFAULT_DISCOVERY_UNIQUE_ID = "default_discovery_unique_id"
 DISCOVERY_NOTIFICATION_ID = "config_entry_discovery"
 DISCOVERY_SOURCES = (
     SOURCE_SSDP,
+    SOURCE_USB,
+    SOURCE_DHCP,
+    SOURCE_HOMEKIT,
     SOURCE_ZEROCONF,
+    SOURCE_HOMEKIT,
+    SOURCE_DHCP,
     SOURCE_DISCOVERY,
     SOURCE_IMPORT,
     SOURCE_UNIGNORE,
@@ -598,7 +609,10 @@ class ConfigEntriesFlowManager(data_entry_flow.FlowManager):
     """Manage all the config entry flows that are in progress."""
 
     def __init__(
-        self, hass: HomeAssistant, config_entries: ConfigEntries, hass_config: dict
+        self,
+        hass: HomeAssistant,
+        config_entries: ConfigEntries,
+        hass_config: ConfigType,
     ) -> None:
         """Initialize the config entry flow manager."""
         super().__init__(hass)
@@ -748,13 +762,14 @@ class ConfigEntries:
     An instance of this object is available via `hass.config_entries`.
     """
 
-    def __init__(self, hass: HomeAssistant, hass_config: dict) -> None:
+    def __init__(self, hass: HomeAssistant, hass_config: ConfigType) -> None:
         """Initialize the entry manager."""
         self.hass = hass
         self.flow = ConfigEntriesFlowManager(hass, self, hass_config)
         self.options = OptionsFlowManager(hass)
         self._hass_config = hass_config
         self._entries: dict[str, ConfigEntry] = {}
+        self._domain_index: dict[str, list[str]] = {}
         self._store = hass.helpers.storage.Store(STORAGE_VERSION, STORAGE_KEY)
         EntityRegistryDisabledHandler(hass).async_setup()
 
@@ -782,7 +797,9 @@ class ConfigEntries:
         """Return all entries or entries for a specific domain."""
         if domain is None:
             return list(self._entries.values())
-        return [entry for entry in self._entries.values() if entry.domain == domain]
+        return [
+            self._entries[entry_id] for entry_id in self._domain_index.get(domain, [])
+        ]
 
     async def async_add(self, entry: ConfigEntry) -> None:
         """Add and setup an entry."""
@@ -791,6 +808,7 @@ class ConfigEntries:
                 f"An entry with the id {entry.entry_id} already exists."
             )
         self._entries[entry.entry_id] = entry
+        self._domain_index.setdefault(entry.domain, []).append(entry.entry_id)
         await self.async_setup(entry.entry_id)
         self._async_schedule_save()
 
@@ -809,6 +827,9 @@ class ConfigEntries:
         await entry.async_remove(self.hass)
 
         del self._entries[entry.entry_id]
+        self._domain_index[entry.domain].remove(entry.entry_id)
+        if not self._domain_index[entry.domain]:
+            del self._domain_index[entry.domain]
         self._async_schedule_save()
 
         dev_reg, ent_reg = await asyncio.gather(
@@ -850,7 +871,7 @@ class ConfigEntries:
     async def _async_shutdown(self, event: Event) -> None:
         """Call when Home Assistant is stopping."""
         await asyncio.gather(
-            *[entry.async_shutdown() for entry in self._entries.values()]
+            *(entry.async_shutdown() for entry in self._entries.values())
         )
         await self.flow.async_shutdown()
 
@@ -867,9 +888,11 @@ class ConfigEntries:
 
         if config is None:
             self._entries = {}
+            self._domain_index = {}
             return
 
         entries = {}
+        domain_index: dict[str, list[str]] = {}
 
         for entry in config["entries"]:
             pref_disable_new_entities = entry.get("pref_disable_new_entities")
@@ -880,10 +903,13 @@ class ConfigEntries:
                     "disable_new_entities"
                 )
 
-            entries[entry["entry_id"]] = ConfigEntry(
+            domain = entry["domain"]
+            entry_id = entry["entry_id"]
+
+            entries[entry_id] = ConfigEntry(
                 version=entry["version"],
-                domain=entry["domain"],
-                entry_id=entry["entry_id"],
+                domain=domain,
+                entry_id=entry_id,
                 data=entry["data"],
                 source=entry["source"],
                 title=entry["title"],
@@ -897,7 +923,9 @@ class ConfigEntries:
                 pref_disable_new_entities=pref_disable_new_entities,
                 pref_disable_polling=entry.get("pref_disable_polling"),
             )
+            domain_index.setdefault(domain, []).append(entry_id)
 
+        self._domain_index = domain_index
         self._entries = entries
 
     async def async_setup(self, entry_id: str) -> bool:
@@ -1082,10 +1110,10 @@ class ConfigEntries:
         """Forward the unloading of an entry to platforms."""
         return all(
             await asyncio.gather(
-                *[
+                *(
                     self.async_forward_entry_unload(entry, platform)
                     for platform in platforms
-                ]
+                )
             )
         )
 
@@ -1191,7 +1219,7 @@ class ConfigFlow(data_entry_flow.FlowHandler):
             return None
 
         if raise_on_progress:
-            for progress in self._async_in_progress():
+            for progress in self._async_in_progress(include_uninitialized=True):
                 if progress["context"].get("unique_id") == unique_id:
                     raise data_entry_flow.AbortFlow("already_in_progress")
 
@@ -1199,7 +1227,7 @@ class ConfigFlow(data_entry_flow.FlowHandler):
 
         # Abort discoveries done using the default discovery unique id
         if unique_id != DEFAULT_DISCOVERY_UNIQUE_ID:
-            for progress in self._async_in_progress():
+            for progress in self._async_in_progress(include_uninitialized=True):
                 if progress["context"].get("unique_id") == DEFAULT_DISCOVERY_UNIQUE_ID:
                     self.hass.config_entries.flow.async_abort(progress["flow_id"])
 
@@ -1362,6 +1390,12 @@ class ConfigFlow(data_entry_flow.FlowHandler):
         """Handle a flow initialized by DHCP discovery."""
         return await self.async_step_discovery(discovery_info)
 
+    async def async_step_usb(
+        self, discovery_info: DiscoveryInfoType
+    ) -> data_entry_flow.FlowResult:
+        """Handle a flow initialized by USB discovery."""
+        return await self.async_step_discovery(discovery_info)
+
     @callback
     def async_create_entry(  # pylint: disable=arguments-differ
         self,
@@ -1506,7 +1540,7 @@ class EntityRegistryDisabledHandler:
         )
 
         await asyncio.gather(
-            *[self.hass.config_entries.async_reload(entry_id) for entry_id in to_reload]
+            *(self.hass.config_entries.async_reload(entry_id) for entry_id in to_reload)
         )
 
 

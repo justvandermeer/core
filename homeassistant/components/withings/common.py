@@ -640,6 +640,7 @@ class DataManager:
 
         Withings' API occasionally and incorrectly throws errors. Retrying the call tends to work.
         """
+        # pylint: disable=no-self-use
         exception = None
         for attempt in range(1, attempts + 1):
             _LOGGER.debug("Attempt %s of %s", attempt, attempts)
@@ -673,21 +674,17 @@ class DataManager:
         response = await self._hass.async_add_executor_job(self._api.notify_list)
 
         subscribed_applis = frozenset(
-            [
-                profile.appli
-                for profile in response.profiles
-                if profile.callbackurl == self._webhook_config.url
-            ]
+            profile.appli
+            for profile in response.profiles
+            if profile.callbackurl == self._webhook_config.url
         )
 
         # Determine what subscriptions need to be created.
         ignored_applis = frozenset({NotifyAppli.USER, NotifyAppli.UNKNOWN})
         to_add_applis = frozenset(
-            [
-                appli
-                for appli in NotifyAppli
-                if appli not in subscribed_applis and appli not in ignored_applis
-            ]
+            appli
+            for appli in NotifyAppli
+            if appli not in subscribed_applis and appli not in ignored_applis
         )
 
         # Subscribe to each one.
@@ -796,6 +793,7 @@ class DataManager:
             )
             for group in groups
             for measure in group.measures
+            if measure.type in WITHINGS_MEASURE_TYPE_MAP
         }
 
     async def async_get_sleep_summary(self) -> dict[MeasureType, Any]:

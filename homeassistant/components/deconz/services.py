@@ -153,7 +153,7 @@ async def async_refresh_devices_service(gateway):
     await gateway.api.refresh_state()
     gateway.ignore_state_updates = False
 
-    for new_device_type in [NEW_GROUP, NEW_LIGHT, NEW_SCENE, NEW_SENSOR]:
+    for new_device_type in (NEW_GROUP, NEW_LIGHT, NEW_SCENE, NEW_SENSOR):
         gateway.async_add_device_callback(new_device_type, force=True)
 
 
@@ -185,7 +185,7 @@ async def async_remove_orphaned_entries_service(gateway):
 
     # Don't remove the Gateway service entry
     gateway_service = device_registry.async_get_device(
-        identifiers={(DOMAIN, gateway.api.config.bridgeid)}, connections=set()
+        identifiers={(DOMAIN, gateway.api.config.bridge_id)}, connections=set()
     )
     if gateway_service.id in devices_to_be_removed:
         devices_to_be_removed.remove(gateway_service.id)

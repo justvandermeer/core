@@ -1,6 +1,10 @@
 """Models for SQLAlchemy."""
+from __future__ import annotations
+
+from datetime import datetime, timedelta
 import json
 import logging
+from typing import TypedDict, overload
 
 from sqlalchemy import (
     Boolean,
@@ -15,9 +19,9 @@ from sqlalchemy import (
     Text,
     distinct,
 )
-from sqlalchemy.dialects import mysql
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
+from sqlalchemy.dialects import mysql, oracle, postgresql
+from sqlalchemy.ext.declarative import declared_attr
+from sqlalchemy.orm import declarative_base, relationship
 from sqlalchemy.orm.session import Session
 
 from homeassistant.const import (
@@ -36,7 +40,7 @@ import homeassistant.util.dt as dt_util
 # pylint: disable=invalid-name
 Base = declarative_base()
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 21
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -48,6 +52,8 @@ TABLE_RECORDER_RUNS = "recorder_runs"
 TABLE_SCHEMA_CHANGES = "schema_changes"
 TABLE_STATISTICS = "statistics"
 TABLE_STATISTICS_META = "statistics_meta"
+TABLE_STATISTICS_RUNS = "statistics_runs"
+TABLE_STATISTICS_SHORT_TERM = "statistics_short_term"
 
 ALL_TABLES = [
     TABLE_STATES,
@@ -56,10 +62,18 @@ ALL_TABLES = [
     TABLE_SCHEMA_CHANGES,
     TABLE_STATISTICS,
     TABLE_STATISTICS_META,
+    TABLE_STATISTICS_RUNS,
+    TABLE_STATISTICS_SHORT_TERM,
 ]
 
 DATETIME_TYPE = DateTime(timezone=True).with_variant(
     mysql.DATETIME(timezone=True, fsp=6), "mysql"
+)
+DOUBLE_TYPE = (
+    Float()
+    .with_variant(mysql.DOUBLE(asdecimal=False), "mysql")
+    .with_variant(oracle.DOUBLE_PRECISION(), "oracle")
+    .with_variant(postgresql.DOUBLE_PRECISION(), "postgresql")
 )
 
 
@@ -97,7 +111,8 @@ class Events(Base):  # type: ignore
         """Create an event database object from a native event."""
         return Events(
             event_type=event.event_type,
-            event_data=event_data or json.dumps(event.data, cls=JSONEncoder),
+            event_data=event_data
+            or json.dumps(event.data, cls=JSONEncoder, separators=(",", ":")),
             origin=str(event.origin.value),
             time_fired=event.time_fired,
             context_id=event.context.id,
@@ -106,7 +121,7 @@ class Events(Base):  # type: ignore
         )
 
     def to_native(self, validate_entity_id=True):
-        """Convert to a natve HA Event."""
+        """Convert to a native HA Event."""
         context = Context(
             id=self.context_id,
             user_id=self.context_user_id,
@@ -180,7 +195,9 @@ class States(Base):  # type: ignore
         else:
             dbstate.domain = state.domain
             dbstate.state = state.state
-            dbstate.attributes = json.dumps(dict(state.attributes), cls=JSONEncoder)
+            dbstate.attributes = json.dumps(
+                dict(state.attributes), cls=JSONEncoder, separators=(",", ":")
+            )
             dbstate.last_changed = state.last_changed
             dbstate.last_updated = state.last_updated
 
@@ -206,42 +223,91 @@ class States(Base):  # type: ignore
             return None
 
 
-class Statistics(Base):  # type: ignore
-    """Statistics."""
+class StatisticData(TypedDict, total=False):
+    """Statistic data class."""
 
-    __table_args__ = (
-        # Used for fetching statistics for a certain entity at a specific time
-        Index("ix_statistics_statistic_id_start", "metadata_id", "start"),
-    )
-    __tablename__ = TABLE_STATISTICS
+    mean: float
+    min: float
+    max: float
+    last_reset: datetime | None
+    state: float
+    sum: float
+    sum_increase: float
+
+
+class StatisticsBase:
+    """Statistics base class."""
+
     id = Column(Integer, primary_key=True)
     created = Column(DATETIME_TYPE, default=dt_util.utcnow)
-    metadata_id = Column(
-        Integer,
-        ForeignKey(f"{TABLE_STATISTICS_META}.id", ondelete="CASCADE"),
-        index=True,
-    )
-    start = Column(DATETIME_TYPE, index=True)
-    mean = Column(Float())
-    min = Column(Float())
-    max = Column(Float())
-    last_reset = Column(DATETIME_TYPE)
-    state = Column(Float())
-    sum = Column(Float())
 
-    @staticmethod
-    def from_stats(metadata_id, start, stats):
+    @declared_attr
+    def metadata_id(self):
+        """Define the metadata_id column for sub classes."""
+        return Column(
+            Integer,
+            ForeignKey(f"{TABLE_STATISTICS_META}.id", ondelete="CASCADE"),
+            index=True,
+        )
+
+    start = Column(DATETIME_TYPE, index=True)
+    mean = Column(DOUBLE_TYPE)
+    min = Column(DOUBLE_TYPE)
+    max = Column(DOUBLE_TYPE)
+    last_reset = Column(DATETIME_TYPE)
+    state = Column(DOUBLE_TYPE)
+    sum = Column(DOUBLE_TYPE)
+    sum_increase = Column(DOUBLE_TYPE)
+
+    @classmethod
+    def from_stats(cls, metadata_id: str, start: datetime, stats: StatisticData):
         """Create object from a statistics."""
-        return Statistics(
+        return cls(  # type: ignore
             metadata_id=metadata_id,
             start=start,
             **stats,
         )
 
 
+class Statistics(Base, StatisticsBase):  # type: ignore
+    """Long term statistics."""
+
+    duration = timedelta(hours=1)
+
+    __table_args__ = (
+        # Used for fetching statistics for a certain entity at a specific time
+        Index("ix_statistics_statistic_id_start", "metadata_id", "start"),
+    )
+    __tablename__ = TABLE_STATISTICS
+
+
+class StatisticsShortTerm(Base, StatisticsBase):  # type: ignore
+    """Short term statistics."""
+
+    duration = timedelta(minutes=5)
+
+    __table_args__ = (
+        # Used for fetching statistics for a certain entity at a specific time
+        Index("ix_statistics_short_term_statistic_id_start", "metadata_id", "start"),
+    )
+    __tablename__ = TABLE_STATISTICS_SHORT_TERM
+
+
+class StatisticMetaData(TypedDict, total=False):
+    """Statistic meta data class."""
+
+    statistic_id: str
+    unit_of_measurement: str | None
+    has_mean: bool
+    has_sum: bool
+
+
 class StatisticsMeta(Base):  # type: ignore
     """Statistics meta data."""
 
+    __table_args__ = (
+        {"mysql_default_charset": "utf8mb4", "mysql_collate": "utf8mb4_unicode_ci"},
+    )
     __tablename__ = TABLE_STATISTICS_META
     id = Column(Integer, primary_key=True)
     statistic_id = Column(String(255), index=True)
@@ -251,7 +317,13 @@ class StatisticsMeta(Base):  # type: ignore
     has_sum = Column(Boolean)
 
     @staticmethod
-    def from_meta(source, statistic_id, unit_of_measurement, has_mean, has_sum):
+    def from_meta(
+        source: str,
+        statistic_id: str,
+        unit_of_measurement: str | None,
+        has_mean: bool,
+        has_sum: bool,
+    ) -> StatisticsMeta:
         """Create object from meta data."""
         return StatisticsMeta(
             source=source,
@@ -330,7 +402,33 @@ class SchemaChanges(Base):  # type: ignore
         )
 
 
-def process_timestamp(ts):
+class StatisticsRuns(Base):  # type: ignore
+    """Representation of statistics run."""
+
+    __tablename__ = TABLE_STATISTICS_RUNS
+    run_id = Column(Integer, primary_key=True)
+    start = Column(DateTime(timezone=True))
+
+    def __repr__(self) -> str:
+        """Return string representation of instance for debugging."""
+        return (
+            f"<recorder.StatisticsRuns("
+            f"id={self.run_id}, start='{self.start.isoformat(sep=' ', timespec='seconds')}', "
+            f")>"
+        )
+
+
+@overload
+def process_timestamp(ts: None) -> None:
+    ...
+
+
+@overload
+def process_timestamp(ts: datetime) -> datetime:
+    ...
+
+
+def process_timestamp(ts: datetime | None) -> datetime | None:
     """Process a timestamp into datetime object."""
     if ts is None:
         return None
@@ -340,7 +438,17 @@ def process_timestamp(ts):
     return dt_util.as_utc(ts)
 
 
-def process_timestamp_to_utc_isoformat(ts):
+@overload
+def process_timestamp_to_utc_isoformat(ts: None) -> None:
+    ...
+
+
+@overload
+def process_timestamp_to_utc_isoformat(ts: datetime) -> str:
+    ...
+
+
+def process_timestamp_to_utc_isoformat(ts: datetime | None) -> str | None:
     """Process a timestamp into UTC isotime."""
     if ts is None:
         return None

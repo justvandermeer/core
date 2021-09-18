@@ -41,7 +41,6 @@ from .const import (
     MANUFACTURER,
     PLATFORMS,
     PROGRAM_PLATFORMS,
-    UNDO_UPDATE_LISTENER,
 )
 from .helpers import _categorize_nodes, _categorize_programs, _categorize_variables
 from .services import async_setup_services, async_unload_services
@@ -218,9 +217,7 @@ async def async_setup_entry(
 
     await hass.async_add_executor_job(_start_auto_update)
 
-    undo_listener = entry.add_update_listener(_async_update_listener)
-
-    hass_isy_data[UNDO_UPDATE_LISTENER] = undo_listener
+    entry.async_on_unload(entry.add_update_listener(_async_update_listener))
     entry.async_on_unload(
         hass.bus.async_listen_once(EVENT_HOMEASSISTANT_STOP, _stop_auto_update)
     )
@@ -244,11 +241,11 @@ def _async_import_options_from_data_if_missing(
 ):
     options = dict(entry.options)
     modified = False
-    for importable_option in [
+    for importable_option in (
         CONF_IGNORE_STRING,
         CONF_SENSOR_STRING,
         CONF_RESTORE_LIGHT_STATE,
-    ]:
+    ):
         if importable_option not in entry.options and importable_option in entry.data:
             options[importable_option] = entry.data[importable_option]
             modified = True
@@ -289,8 +286,6 @@ async def async_unload_entry(
         isy.websocket.stop()
 
     await hass.async_add_executor_job(_stop_auto_update)
-
-    hass_isy_data[UNDO_UPDATE_LISTENER]()
 
     if unload_ok:
         hass.data[DOMAIN].pop(entry.entry_id)
